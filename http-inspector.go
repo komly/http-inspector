@@ -1,28 +1,37 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
 	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/reflection"
 )
 
 type RequestInfo struct {
-	Method     string              `json:"method"`
-	URL        string              `json:"url"`
-	Headers    map[string][]string `json:"headers"`
-	Body       string              `json:"body"`
-	RemoteAddr string              `json:"remote_addr"`
-	Host       string              `json:"host"`
-	RequestURI string              `json:"request_uri"`
-	Protocol   string              `json:"protocol"`
-	Timestamp  string              `json:"timestamp"`
-	BasicAuth  *BasicAuthInfo      `json:"basic_auth,omitempty"`
+	Method       string              `json:"method"`
+	URL          string              `json:"url,omitempty"`
+	Headers      map[string][]string `json:"headers,omitempty"`
+	Body         string              `json:"body,omitempty"`
+	RemoteAddr   string              `json:"remote_addr"`
+	Host         string              `json:"host,omitempty"`
+	RequestURI   string              `json:"request_uri,omitempty"`
+	Protocol     string              `json:"protocol"`
+	Timestamp    string              `json:"timestamp"`
+	BasicAuth    *BasicAuthInfo      `json:"basic_auth,omitempty"`
+	GrpcMethod   string              `json:"grpc_method,omitempty"`
+	GrpcMetadata metadata.MD         `json:"grpc_metadata,omitempty"`
 }
 
 type BasicAuthInfo struct {
@@ -30,17 +39,80 @@ type BasicAuthInfo struct {
 	Password string `json:"password"`
 }
 
-func main() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+// gRPC interceptor для логирования запросов
+func logInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	p, _ := peer.FromContext(ctx)
+	addr := "unknown"
+	if p != nil {
+		addr = p.Addr.String()
 	}
 
-	http.HandleFunc("/", handleRequest)
+	reqInfo := RequestInfo{
+		Method:       "gRPC",
+		Protocol:     "gRPC",
+		RemoteAddr:   addr,
+		Timestamp:    time.Now().Format(time.RFC3339),
+		GrpcMethod:   info.FullMethod,
+		GrpcMetadata: md,
+	}
 
-	log.Printf("Starting HTTP Inspector on port %s...", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		log.Fatal(err)
+	// Попытаемся сериализовать тело запроса
+	if reqBytes, err := json.Marshal(req); err == nil {
+		reqInfo.Body = string(reqBytes)
+	}
+
+	// Логируем запрос
+	jsonData, _ := json.MarshalIndent(reqInfo, "", "  ")
+	log.Printf("\n=== New gRPC Request ===\n%s\n===============\n", string(jsonData))
+
+	// Вызываем оригинальный обработчик
+	resp, err := handler(ctx, req)
+
+	if err != nil {
+		log.Printf("gRPC error: %v", err)
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+func main() {
+	httpPort := os.Getenv("HTTP_PORT")
+	if httpPort == "" {
+		httpPort = "8080"
+	}
+
+	grpcPort := os.Getenv("GRPC_PORT")
+	if grpcPort == "" {
+		grpcPort = "9090"
+	}
+
+	// Запускаем HTTP сервер
+	go func() {
+		http.HandleFunc("/", handleRequest)
+		log.Printf("Starting HTTP Inspector on port %s...", httpPort)
+		if err := http.ListenAndServe(":"+httpPort, nil); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	// Запускаем gRPC сервер
+	lis, err := net.Listen("tcp", ":"+grpcPort)
+	if err != nil {
+		log.Fatalf("failed to listen: %v", err)
+	}
+
+	s := grpc.NewServer(
+		grpc.UnaryInterceptor(logInterceptor),
+	)
+
+	// Включаем reflection для возможности использования grpcurl
+	reflection.Register(s)
+
+	log.Printf("Starting gRPC Inspector on port %s...", grpcPort)
+	if err := s.Serve(lis); err != nil {
+		log.Fatalf("failed to serve: %v", err)
 	}
 }
 
@@ -90,7 +162,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Log the request details
-	log.Printf("\n=== New Request ===\n%s\n===============\n", string(jsonData))
+	log.Printf("\n=== New HTTP Request ===\n%s\n===============\n", string(jsonData))
 
 	// Always return 200 OK
 	w.WriteHeader(http.StatusOK)
